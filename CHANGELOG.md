@@ -4,6 +4,27 @@ All notable changes to `tilttek/badges-bundle` will be documented in this file.
 
 Updates should follow the [Keep a CHANGELOG](https://keepachangelog.com/) principles.
 
+## 0.2.0-alpha - 2026-11-14
+
+### Changed
+
+- `DbalAwardStore` implements the notices of `AwardStore`: the `notice` column of `tilttek_badges_award` holds
+  `awarded` for an award whose event is still due and `revoked` for a withdrawn award whose event is still due. An
+  existing table gains the column through the application's next migration.
+- `DbalAwardStore::withdraw()` marks the award withdrawn in one conditional statement, whether or not its own event was
+  dispatched: an award withdrawn while another process dispatches its `BadgeAwarded` always leaves a `BadgeRevoked`
+  due, rather than being deleted with no event left to dispatch.
+- `BadgeAwarded` and `BadgeRevoked` are dispatched at least once: a listener that failed is called again when the
+  projection is handed the entry again, before the member's next activity, or through `BadgeProjection::deliver()`.
+  Listeners must be idempotent.
+- The bundle requires `tilttek/badges` `^0.2@dev`, whose notices of `AwardStore` `DbalAwardStore` implements.
+
+### Fixed
+
+- `BadgesPrivacy` implements `Phil\PrivacyBundle\Application\Contract\PersonalDataExporter` and `PersonalDataEraser`,
+  the interfaces `phil/privacy-bundle` exposes, and the bundle registers it when they exist: the export and the
+  erasure of a member now reach it.
+
 ## 0.1.0-alpha - 2026-11-11
 
 ### Added
