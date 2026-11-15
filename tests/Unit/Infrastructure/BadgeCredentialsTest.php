@@ -12,14 +12,20 @@ use Phil\OpenBadges\Issuer;
 use Phil\OpenBadges\Jwt\JwtVerifier;
 use Phil\OpenBadges\Key\Ed25519Signer;
 use Phil\OpenBadges\Recipient;
+use Phil\OpenBadgesBundle\Application\SecuredCredential;
 use Phil\OpenBadgesBundle\Application\Securing;
 use Phil\Resource\ResourceReference;
 use PHPUnit\Framework\Attributes\CoversClass;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\Translation\Loader\ArrayLoader;
 use Symfony\Component\Translation\Translator;
+use Tilttek\Badges\Award;
 use Tilttek\Badges\Exception\NotEarned;
 use Tilttek\Badges\Exception\UnknownBadge;
+use Tilttek\Badges\Store\AwardStore;
+use Tilttek\Badges\Store\InMemoryAwardStore;
+use Tilttek\BadgesBundle\Infrastructure\Doctrine\DbalAwardStore;
 use Tilttek\BadgesBundle\Infrastructure\OpenBadges\BadgeCredentials;
 use Tilttek\BadgesBundle\Tests\Unit\Fixture\Clock;
 use Tilttek\BadgesBundle\Tests\Unit\Fixture\Kit;
@@ -49,14 +55,16 @@ final class BadgeCredentialsTest extends TestCase
 
         $credentials = new BadgeCredentials($badges, $issuer, $securing, 'https://example.org/badges/{code}', 'trophies', $translator);
         $verifier = new JwtVerifier($signer->verificationKey());
-        self::assertSame('application/vc+jwt', $credentials->mediaType());
 
         $badges->award($member, 'games');
         $clock->set('2026-11-08 12:00:00 UTC');
         $second = $badges->award($member, 'games');
         $clock->set('2026-11-09 12:00:00 UTC');
         $badges->award($member, 'organiser');
-        $games = $verifier->verify($this->token($credentials->issue($member, 'games', Recipient::did('did:example:ada'), new DateTimeImmutable('2027-01-01 00:00:00 UTC'))));
+        $secured = $credentials->issue($member, 'games', Recipient::did('did:example:ada'), new DateTimeImmutable('2027-01-01 00:00:00 UTC'));
+        self::assertSame('application/vc+jwt', $secured->mediaType);
+        self::assertSame('credential.jwt', $secured->filename());
+        $games = $verifier->verify($this->token($secured));
         self::assertSame($second->awardedAt->getTimestamp(), $games['nbf'] ?? null);
         self::assertSame(new DateTimeImmutable('2027-01-01 00:00:00 UTC')->getTimestamp(), $games['exp'] ?? null);
         self::assertMatchesRegularExpression('/^urn:uuid:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/D', \is_string($games['jti'] ?? null) ? $games['jti'] : '');
@@ -88,11 +96,48 @@ final class BadgeCredentialsTest extends TestCase
         $credentials = new BadgeCredentials($badges, new CredentialIssuer(new Issuer('https://example.org/issuer', 'Example'), $signer), $securing, 'https://example.org/badges/{code}', 'badges');
         $badges->award($member, 'organiser');
 
-        $document = $credentials->issue($member, 'organiser', Recipient::did('did:example:ada'));
+        $secured = $credentials->issue($member, 'organiser', Recipient::did('did:example:ada'));
+        self::assertSame('application/vc', $secured->mediaType);
+        self::assertSame('credential.json', $secured->filename());
+        $document = json_decode($secured->content, true, flags: \JSON_THROW_ON_ERROR);
         self::assertIsArray($document);
         self::assertSame('https://example.org/badges/organiser', $this->achievement($document)['id'] ?? null);
         self::assertSame(['type' => 'DataIntegrityProof', 'cryptosuite' => 'eddsa-rdfc-2022'], array_intersect_key(\is_array($document['proof'] ?? null) ? $document['proof'] : [], ['type' => true, 'cryptosuite' => true]));
-        self::assertSame('application/vc', $credentials->mediaType());
+    }
+
+    /**
+     * @return iterable<string, array{AwardStore, list<array{int, string}>, string}>
+     */
+    public static function awardsOfARepeatableBadge(): iterable
+    {
+        foreach (['memory' => static fn (): AwardStore => new InMemoryAwardStore(), 'dbal' => static fn (): AwardStore => new DbalAwardStore(Database::connection())] as $name => $store) {
+            yield $name.', one moment' => [$store(), [[1, '2026-11-08 12:00:00 UTC'], [2, '2026-11-08 12:00:00 UTC']], '2026-11-08 12:00:00 UTC'];
+            yield $name.', moments reversed' => [$store(), [[1, '2026-11-09 12:00:00 UTC'], [2, '2026-11-08 12:00:00 UTC']], '2026-11-08 12:00:00 UTC'];
+            yield $name.', highest number in the middle' => [$store(), [[1, '2026-11-10 12:00:00 UTC'], [2, '2026-11-08 12:00:00 UTC'], [3, '2026-11-09 12:00:00 UTC']], '2026-11-09 12:00:00 UTC'];
+        }
+    }
+
+    /**
+     * @param list<array{int, string}> $awards the number and the moment of each award of the repeatable badge
+     */
+    #[DataProvider('awardsOfARepeatableBadge')]
+    public function testTheCredentialIsTheAwardWithTheHighestNumber(AwardStore $store, array $awards, string $validFrom): void
+    {
+        $clock = new Clock();
+        $member = ResourceReference::of('member', '1');
+        $signer = Ed25519Signer::fromSeed(str_repeat("\1", 32));
+        $credentials = new BadgeCredentials(Kit::badges($clock, $store), new CredentialIssuer(new Issuer('https://example.org/issuer', 'Example'), $signer), new Securing($signer, 'https://example.org/issuer#key-1', Securing::JWT, $clock), 'https://example.org/badges/{code}', 'badges');
+
+        foreach ($awards as [$number, $moment]) {
+            self::assertTrue($store->add(new Award('games', $member, $number, new DateTimeImmutable($moment), 'reason', true)));
+        }
+
+        // Another badge earned later, and another member's later award of the same badge, are not the one issued.
+        self::assertTrue($store->add(new Award('organiser', $member, 1, new DateTimeImmutable('2026-11-11 12:00:00 UTC'), 'reason', true)));
+        self::assertTrue($store->add(new Award('games', ResourceReference::of('member', '2'), 9, new DateTimeImmutable('2026-11-12 12:00:00 UTC'), 'reason', true)));
+
+        $claims = new JwtVerifier($signer->verificationKey())->verify($this->token($credentials->issue($member, 'games', Recipient::did('did:example:ada'))));
+        self::assertSame(new DateTimeImmutable($validFrom)->getTimestamp(), $claims['nbf'] ?? null);
     }
 
     public function testACredentialIsIssuedOnlyForAnEarnedBadge(): void
@@ -107,11 +152,11 @@ final class BadgeCredentialsTest extends TestCase
         $this->credentials()->issue(ResourceReference::of('member', '1'), 'gold', Recipient::did('did:example:ada'));
     }
 
-    private function token(mixed $credential): string
+    private function token(SecuredCredential $credential): string
     {
-        self::assertIsString($credential);
+        self::assertTrue($credential->isToken());
 
-        return $credential;
+        return $credential->content;
     }
 
     private function credentials(): BadgeCredentials
